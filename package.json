@@ -1,0 +1,26 @@
+{
+  "name": "@jnode/db",
+  "version": "0.0.1",
+  "description": "Simple database package for Node.js.",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "echo \"Hello, database.\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/japple-jnode/db.git"
+  },
+  "keywords": [
+    "JustNode",
+    "JustApple",
+    "Database",
+    "JSON",
+    "DB"
+  ],
+  "author": "JustApple <apple@justapple.tw>",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/japple-jnode/db/issues"
+  },
+  "homepage": "https://github.com/japple-jnode/db#readme"
+}
