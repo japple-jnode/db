@@ -26,14 +26,19 @@ class DBLEFile {
     static async load(path, options = {}) {
         const jdb = await JDBFile.load(path);
 
-        if (jdb.dbType !== 0x44424C45) throw new Error('JDB (DBLE): DBType is not "DBLE".'); // db type
-        if (jdb.dbVersion !== 1) throw new Error('JDB (DBLE): Unsupported DBLE DBVersion.'); // db version
+        try {
+            if (jdb.dbType !== 0x44424C45) throw new Error('JDB (DBLE): DBType is not "DBLE".'); // db type
+            if (jdb.dbVersion !== 1) throw new Error('JDB (DBLE): Unsupported DBLE DBVersion.'); // db version
 
-        const dble = new DBLEFile(jdb, options);
-        await dble._loadHead();
-        await dble._loadIndices();
+            const dble = new DBLEFile(jdb, options);
+            await dble._loadHead();
+            await dble._loadIndices();
 
-        return dble;
+            return dble;
+        } catch (e) {
+            await jdb.close();
+            throw e;
+        }
     }
 
     static async create(path, options = {}) {
@@ -43,9 +48,13 @@ class DBLEFile {
         });
 
         const dble = new DBLEFile(jdb, options);
-        await dble._init(options);
-
-        return dble;
+        try {
+            await dble._init(options);
+            return dble;
+        } catch (e) {
+            await jdb.close();
+            throw e;
+        }
     }
 
     static async forceCreate(path, options = {}) {
@@ -55,9 +64,13 @@ class DBLEFile {
         });
 
         const dble = new DBLEFile(jdb, options);
-        await dble._init(options);
-
-        return dble;
+        try {
+            await dble._init(options);
+            return dble;
+        } catch (e) {
+            await jdb.close();
+            throw e;
+        }
     }
 
     async _init(options = {}) {
@@ -88,14 +101,14 @@ class DBLEFile {
 
         this.extOffset = dbLineLength;
 
-        // calculate ext field length
+        // calculate ext field length dynamically as a power of 2
         let n = dbLineLength + 1 + (options.extBaseLength ?? 0);
         n |= n >> 1;
         n |= n >> 2;
         n |= n >> 4;
         n |= n >> 8;
         n |= n >> 16;
-        n = n + 1;
+        n++;
 
         let extBaseLength = n - dbLineLength;
         this.extBaseLength = extBaseLength;
@@ -142,8 +155,6 @@ class DBLEFile {
         };
 
         while (!fieldIsLast) {
-            let bytesRead;
-
             // load flags and field length
             const flagLenBuf = await readBytes(4);
             const fieldFlags = flagLenBuf.readUInt16BE();
@@ -188,16 +199,23 @@ class DBLEFile {
         this.bodyOffset += ((dbHeadLength + dbLineLength - 1) & ~(dbLineLength - 1)) - dbHeadLength;
     }
 
-    // close file handle
+    // safely retrieve normalized index mapping target mapping
+    _getIndexKey(val) {
+        return Buffer.isBuffer(val) ? val.toString('hex') : val;
+    }
+
+    // close file handle safely through the inner task queue
     close() {
-        return this.jdb.close();
+        return this._doTask(async () => {
+            return await this.jdb.close();
+        });
     }
 
     // load indices
     async _loadIndices() {
         for await (let { chunk, line } of this._readlines()) {
             for (let i in this.indices) {
-                this.indices[i].set(this._getFieldFromLine(chunk, i), line);
+                this.indices[i].set(this._getIndexKey(this._getFieldFromLine(chunk, i)), line);
             }
         }
     }
@@ -212,9 +230,11 @@ class DBLEFile {
     }
 
     _setLineCache(line, buf) {
+        // enforce LRU replacement mechanic mapping
+        this._lineCache.delete(line);
         this._lineCache.set(line, buf);
 
-        // remove last added cache
+        // remove oldest added cache
         if (this._lineCache.size > (this.options.maxLineCache || 512)) {
             this._lineCache.delete(this._lineCache.keys().next().value);
         }
@@ -229,7 +249,8 @@ class DBLEFile {
 
         // read line
         const lineBuf = Buffer.allocUnsafe(this.lineLength);
-        await this.jdb.handle.read(lineBuf, 0, this.lineLength, this.bodyOffset + line * this.lineLength);
+        const { bytesRead } = await this.jdb.handle.read(lineBuf, 0, this.lineLength, this.bodyOffset + line * this.lineLength);
+        if (bytesRead !== this.lineLength) throw new Error('JDB (DBLE): Unexpected end of file.');
 
         // add to cache
         this._setLineCache(line, lineBuf);
@@ -238,36 +259,39 @@ class DBLEFile {
     }
 
     // write a buffer to line
-    async _writeLineBuffer(line, buf, offset) {
+    async _writeLineBuffer(line, buf, offset = 0) {
         if (typeof line !== 'number') throw new TypeError('line must be an integer.');
         if (!Buffer.isBuffer(buf)) throw new TypeError('buf must be a buffer.');
 
+        const writeBuf = offset === 0 && buf.length === this.lineLength ? buf : buf.subarray(offset, offset + this.lineLength);
+
         // write line
-        await this.jdb.handle.write(buf, offset, this.lineLength, this.bodyOffset + line * this.lineLength);
+        await this.jdb.handle.write(writeBuf, 0, this.lineLength, this.bodyOffset + line * this.lineLength);
 
         // add to cache
-        this._setLineCache(line, buf);
-
-        return;
+        this._setLineCache(line, writeBuf);
     }
 
     // append a line
-    async _appendLineBuffer(buf, offset) {
+    async _appendLineBuffer(buf, offset = 0) {
         if (!Buffer.isBuffer(buf)) throw new TypeError('buf must be a buffer.');
 
+        const writeBuf = offset === 0 && buf.length === this.lineLength ? buf : buf.subarray(offset, offset + this.lineLength);
         let targetLine = this.lastEmptyLine;
+
         if (targetLine === 0xFFFFFFFF) { // no empty lines
             const { size } = await this.jdb.handle.stat();
 
             // write line
-            await this.jdb.handle.write(buf, offset, this.lineLength, size);
+            await this.jdb.handle.write(writeBuf, 0, this.lineLength, size);
 
             // add to cache
-            this._setLineCache((size - this.bodyOffset) / this.lineLength, buf);
+            targetLine = (size - this.bodyOffset) / this.lineLength;
+            this._setLineCache(targetLine, writeBuf);
         } else { // empty line
             const lineBuf = await this._getLineBuffer(targetLine);
             this.lastEmptyLine = lineBuf.readUInt32LE(2);
-            await this._writeLineBuffer(targetLine, buf);
+            await this._writeLineBuffer(targetLine, writeBuf);
 
             // write back the last empty line
             const lastEmptyLineBuf = Buffer.allocUnsafe(4);
@@ -277,7 +301,7 @@ class DBLEFile {
 
         // update indecies
         for (let i in this.indices) {
-            this.indices[i].set(this._getFieldFromLine(buf, i), targetLine);
+            this.indices[i].set(this._getIndexKey(this._getFieldFromLine(writeBuf, i)), targetLine);
         }
 
         return targetLine;
@@ -305,7 +329,9 @@ class DBLEFile {
 
     _setFieldsToLine(buf, fields) {
         for (let field in fields) {
-            this.fieldsMap[field].write(fields[field], buf, this.fieldOffsets[field]);
+            if (this.fieldsMap[field]) {
+                this.fieldsMap[field].write(fields[field], buf, this.fieldOffsets[field]);
+            }
         }
         return buf;
     }
@@ -316,23 +342,26 @@ class DBLEFile {
         let lineBuf;
         let nextLine = line;
 
-        const clearedBuf = Buffer.alloc(this.lineLength);
-        clearedBuf[0] = 0b10 << 6;
-
         while (nextLine !== 0xFFFFFFFF) {
             lineBuf = await this._getLineBuffer(nextLine);
+            const actualNext = lineBuf.readUInt32LE(2);
 
-            if (lineBuf[0] === (0b11 << 6)) { // remove from index
+            const type = lineBuf[0] & 0xC0;
+            if (type === (0b00 << 6) || type === (0b11 << 6)) { // remove from index mapping
                 for (let i in this.indices) {
-                    this.indices[i].delete(this._getFieldFromLine(lineBuf, i));
+                    this.indices[i].delete(this._getIndexKey(this._getFieldFromLine(lineBuf, i)));
                 }
             }
 
+            const clearedBuf = Buffer.alloc(this.lineLength);
+            clearedBuf[0] = (lineBuf[0] & 0x3F) | (0b10 << 6); // Preserve 14-bit flag, toggle 'Empty' state safely
             clearedBuf.writeUInt32LE(this.lastEmptyLine, 2);
+
             this.lastEmptyLine = nextLine;
             await this._writeLineBuffer(nextLine, clearedBuf);
             this._lineCache.delete(nextLine);
-            nextLine = lineBuf.readUInt32LE(2);
+
+            nextLine = actualNext;
         }
 
         // write back the last empty line
@@ -345,14 +374,16 @@ class DBLEFile {
         let line = start;
         const bufSize = this.options.scanBufferSize || 512;
         let chunkLine = 0;
-        let chunk = Buffer.allocUnsafe(bufSize * this.lineLength);
+        let chunk = null;
         let chunkSize = 0;
+
         while (true) {
             if (end !== undefined && line >= end) return;
             if (chunkLine === chunkSize) {
+                chunk = Buffer.allocUnsafe(bufSize * this.lineLength);
                 const { bytesRead } = await this.jdb.handle.read(chunk, 0, chunk.length, this.bodyOffset + line * this.lineLength);
                 chunkSize = bytesRead / this.lineLength;
-                if (bytesRead % this.lineLength !== 0) throw new Error('JDB (DBLE): File broken.');
+                if (bytesRead % this.lineLength !== 0) throw new Error('JDB (DBLE): File broken. Reading non-aligned chunk blocks.');
                 if (bytesRead === 0) return;
                 chunkLine = 0;
                 continue;
@@ -363,13 +394,13 @@ class DBLEFile {
             line++;
             chunkLine++;
 
-            if (startLineOnly && ((lineChunk[0] & (0b11 << 6)) !== (0b00 << 6))) continue;
+            if (startLineOnly && ((lineChunk[0] & 0xC0) !== (0b00 << 6))) continue;
             yield { chunk: lineChunk, line: line - 1 };
         }
     }
 
     _parseLine(buf) {
-        const lineType = buf[0] & (0b11 << 6);
+        const lineType = (buf[0] & 0xC0) >> 6;
         const nextLine = buf.readUInt32LE(2);
         const line = { type: lineType };
 
@@ -382,7 +413,7 @@ class DBLEFile {
             }
         } else if (line.type === 0b01) { // extended (this function does not parse extended lines)
             line.nextLine = nextLine;
-        } else if (line.type === 0b10) {
+        } else if (line.type === 0b10) { // empty
             line.lastEmptyLine = nextLine;
         }
 
@@ -405,10 +436,7 @@ class DBLEFile {
             let lengthRead = 0;
 
             while (nextLine !== 0xFFFFFFFF) {
-                if (length === lengthRead) {
-                    await this._clearLinesFrom(nextLine);
-                    break;
-                }
+                if (length === lengthRead) break;
 
                 lineBuf = await this._getLineBuffer(nextLine);
                 nextLine = lineBuf.readUInt32LE(2);
@@ -430,21 +458,26 @@ class DBLEFile {
     }
 
     getLineByField(field, query, skipQueue) {
-        if (this.indices[field]) {
-            return this.indices[field].get(query);
-        } else {
-            return this._doTask(async () => {
-                for await (let { buf, line } of this._readlines()) {
-                    if (this._getFieldFromLine(buf, field) === query) return line;
+        return this._doTask(async () => {
+            if (this.indices[field]) {
+                return this.indices[field].get(this._getIndexKey(query));
+            } else {
+                for await (let { chunk, line } of this._readlines()) {
+                    let val = this._getFieldFromLine(chunk, field);
+                    if (Buffer.isBuffer(val) && Buffer.isBuffer(query)) {
+                        if (val.equals(query)) return line;
+                    } else if (val === query) {
+                        return line;
+                    }
                 }
-            }, skipQueue);
-        }
+            }
+        }, skipQueue);
     }
 
     findLine(fn, skipQueue) {
         return this._doTask(async () => {
-            for await (let { buf, line } of this._readlines()) {
-                const parsed = this._parseLine(buf);
+            for await (let { chunk, line } of this._readlines()) {
+                const parsed = this._parseLine(chunk);
                 if (await fn(parsed)) return line;
             }
         }, skipQueue);
@@ -452,8 +485,8 @@ class DBLEFile {
 
     forEachLine(fn, start, to, skipQueue) {
         return this._doTask(async () => {
-            for await (let { buf, line } of this._readlines(start, to)) {
-                const parsed = this._parseLine(buf);
+            for await (let { chunk, line } of this._readlines(start, to)) {
+                const parsed = this._parseLine(chunk);
                 await fn(parsed, line);
             }
         }, skipQueue);
@@ -463,14 +496,23 @@ class DBLEFile {
         return this._doTask(async () => {
             if (typeof line === 'number') { // edit a line
                 const buf = await this._getLineBuffer(line);
-                buf[0] |= 0b00 << 6; // set type
+                buf[0] = (buf[0] & 0x3F) | (0b00 << 6); // set type appropriately
 
-                // check index
+                // check index mappings accurately
                 for (let i in this.indices) {
                     const currentValue = this._getFieldFromLine(buf, i);
-                    if ((fields[i] !== undefined) && (currentValue !== fields[i])) { // update index
-                        this.indices[i].delete(currentValue);
-                        this.indices[i].set(fields[i], (size - this.bodyOffset) / this.lineLength);
+                    const newVal = fields[i];
+
+                    if (newVal !== undefined) {
+                        let isDifferent = currentValue !== newVal;
+                        if (Buffer.isBuffer(currentValue) && Buffer.isBuffer(newVal)) {
+                            isDifferent = !currentValue.equals(newVal);
+                        }
+
+                        if (isDifferent) {
+                            this.indices[i].delete(this._getIndexKey(currentValue));
+                            this.indices[i].set(this._getIndexKey(newVal), line);
+                        }
                     }
                 }
 
@@ -479,7 +521,7 @@ class DBLEFile {
                 return line;
             } else { // create a new line
                 const buf = Buffer.alloc(this.lineLength);
-                buf[0] = 0b00 << 6; // set type
+                buf[0] = (buf[0] & 0x3F) | (0b00 << 6); // set type 
                 this._setFieldsToLine(buf, fields);
                 buf.writeUInt32LE(0xFFFFFFFF, 2);
 
@@ -502,7 +544,12 @@ class DBLEFile {
                 await this._clearLinesFrom(line);
             } else {
                 const buf = await this._getLineBuffer(line);
-                buf[0] = 0b11 << 6; // set type: deleted start
+                if ((buf[0] & 0xC0) === (0b00 << 6)) {
+                    for (let i in this.indices) {
+                        this.indices[i].delete(this._getIndexKey(this._getFieldFromLine(buf, i)));
+                    }
+                }
+                buf[0] = (buf[0] & 0x3F) | (0b11 << 6); // preserve flags safely, set deleted type
                 await this._writeLineBuffer(line, buf);
             }
         }, skipQueue);
@@ -511,22 +558,23 @@ class DBLEFile {
     deleteLineByField(field, query, releaseSpace, skipQueue) {
         return this._doTask(async () => {
             const line = await this.getLineByField(field, query, true);
-            await this.deleteLine(line, releaseSpace, true);
+            if (line !== undefined) await this.deleteLine(line, releaseSpace, true);
         }, skipQueue);
     }
 
     cleanUp(skipQueue) {
         return this._doTask(async () => {
             for await (let { chunk, line } of this._readlines(0, undefined, false)) {
-                if (chunk[0] === (0b11 << 6)) await this._clearLinesFrom(line);
+                if ((chunk[0] & 0xC0) === (0b11 << 6)) await this._clearLinesFrom(line);
             }
         }, skipQueue);
     }
 
     setExt(line, ext = Buffer.alloc(0), skipQueue) {
         return this._doTask(async () => {
-            const linesNeeded = 1 + Math.ceil((ext.length - this.extBaseLength + 2) / (this.lineLength - 6));
-            let lastLine = line;
+            if (!Buffer.isBuffer(ext)) ext = Buffer.from(ext);
+
+            const linesNeeded = ext.length <= this.extBaseLength - 2 ? 1 : 1 + Math.ceil((ext.length - this.extBaseLength + 2) / (this.lineLength - 6));
             let offset = this.extBaseLength - 2;
             let lineBuf = await this._getLineBuffer(line);
             await this._clearLinesFrom(lineBuf.readUInt32LE(2));
@@ -535,17 +583,23 @@ class DBLEFile {
             let nextLine = await this._getLastEmptyLine();
             lineBuf.writeUInt32LE((linesNeeded > 1) ? nextLine : 0xFFFFFFFF, 2);
             lineBuf.writeUInt16LE(ext.length, this.extOffset);
-            ext.copy(lineBuf, this.extOffset + 2, 0, this.extBaseLength - 2);
+
+            const baseWriteLen = Math.min(ext.length, this.extBaseLength - 2);
+            ext.copy(lineBuf, this.extOffset + 2, 0, baseWriteLen);
+            lineBuf.fill(0, this.extOffset + 2 + baseWriteLen, this.extOffset + this.extBaseLength); // clean trailing ghosts
+
             await this._writeLineBuffer(line, lineBuf);
 
             for (let i = 1; i < linesNeeded; i++) {
                 nextLine = await this._getLastEmptyLine(nextLine);
-                console.log(nextLine);
                 const extBuf = Buffer.alloc(this.lineLength);
-                extBuf[0] = 0b01 << 6; // type: extended
+                extBuf[0] = (extBuf[0] & 0x3F) | (0b01 << 6); // extended type toggle preserving 14-bit flag bounds
                 extBuf.writeUInt32LE((linesNeeded - 1 > i) ? nextLine : 0xFFFFFFFF, 2);
-                ext.copy(extBuf, 6, offset, offset + this.lineLength - 6);
-                offset += this.lineLength - 6;
+
+                const partLen = Math.min(ext.length - offset, this.lineLength - 6);
+                ext.copy(extBuf, 6, offset, offset + partLen);
+                offset += partLen;
+
                 await this._appendLineBuffer(extBuf);
             }
         }, skipQueue);
@@ -554,7 +608,8 @@ class DBLEFile {
     setExtByField(field, query, ext, skipQueue) {
         return this._doTask(async () => {
             const line = await this.getLineByField(field, query, true);
-            await this.setExt(line, ext, true);
+            if (line !== undefined) await this.setExt(line, ext, true);
+            else throw new Error(`JDB (DBLE): Line not found by field "${field}".`);
         }, skipQueue);
     }
 }
@@ -582,8 +637,8 @@ class DBLEField {
         const nameBuf = Buffer.from(this.name, 'utf8');
 
         // safety check
-        if (typeBuf.length > 127) throw new Error('Field type length must not over 127 bytes.');
-        if (nameBuf.length > 127) throw new Error('Field name length must not over 127 bytes.');
+        if (typeBuf.length > 255) throw new Error('Field type length must not over 255 bytes.');
+        if (nameBuf.length > 255) throw new Error('Field name length must not over 255 bytes.');
 
         const definitionBuf = Buffer.alloc(6 + typeBuf.length + nameBuf.length);
 
@@ -722,7 +777,7 @@ class DBLEBigUInt64Field extends DBLEField {
     }
 
     parse(buf, offset) {
-        return buf.readBigUint64LE(offset);
+        return buf.readBigUInt64LE(offset);
     }
 
     write(data, buf = Buffer.alloc(this.length), offset = 0) {
