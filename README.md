@@ -14,12 +14,13 @@
 [3 Byte] RSV
 ---- DB Head
 [Array ] Definition
-  [16 Bit] Flag (isLast, isKey, RSV...)
+  [16 Bit] Flag (isLast, isKey, isRelative RSV...)
   [UInt16] Field Length
   [UInt8 ] Type Name Length
   [String] Type Name
   [UInt8 ] Field Name Length
   [String] Field Name
+  [n Byte] (OPTIONAL) Field Relative Data
 [UInt16] Extend Field Base Length (making each line 2 ** N bytes)
 [UInt32] Last Empty Line (0xFFFFFFFF for null)
 [n Byte] Padding (making 'File Head' + 'DB Head' N * Line Length)

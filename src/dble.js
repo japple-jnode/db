@@ -5,7 +5,8 @@ Simple database package for Node.js.
 
 JDB Lite Extended (DBLE) is a simple, fast and extensiable database format.
 
-by JustApple & Google Gemini
+by JustApple     (format design, programming) &
+   Google Gemini (code review, small bug fix, completion of default types)
 */
 
 // load class
@@ -18,9 +19,6 @@ class DBLEFile {
         this.options = options;
         this._lineCache = new Map();
         this.types = Object.assign({}, defaultDBLETypes, options.types);
-        this.jdb.handle.on('close', () => {
-            console.log('closed');
-        })
     }
 
     static async load(path, options = {}) {
@@ -80,6 +78,8 @@ class DBLEFile {
         this.fieldsMap = {};
         this.fieldOffsets = {};
         this.indices = {};
+        this.relatives = {};
+        this.relativeOffsets = {};
 
         // generate definitions
         const dbHeadBufs = [];
@@ -97,6 +97,10 @@ class DBLEFile {
             dbHeadBufs.push(definitionBuf);
             dbHeadLength += definitionBuf.length;
             dbLineLength += def.length;
+            if (def.isRelative) { // set relatives
+                this.relatives[def.name] = this._getDefaultOf(def);
+                this.relativeOffsets[def.name] = dbHeadLength - def.length - 6;
+            }
         }
 
         this.extOffset = dbLineLength;
@@ -136,10 +140,13 @@ class DBLEFile {
         this.fieldOffsets = {};
         this.indices = {};
         this.bodyOffset = 16;
+        this.relatives = {};
+        this.relativeOffsets = {};
 
         // parse definitions
         let fieldIsLast = false;
         let fieldIsKey = false;
+        let fieldIsRelative = false;
         let fieldLength = 0;
         let fieldType = 'null';
         let fieldName = 'null';
@@ -160,6 +167,7 @@ class DBLEFile {
             const fieldFlags = flagLenBuf.readUInt16BE();
             fieldIsLast = fieldFlags & 1;
             fieldIsKey = fieldFlags & (1 << 1);
+            fieldIsRelative = fieldFlags & (1 << 2);
             fieldLength = flagLenBuf.readUInt16LE(2);
 
             // load type
@@ -174,6 +182,7 @@ class DBLEFile {
             const FieldType = this.types[fieldType] || DBLEAnyField;
             const field = new FieldType;
             field.isKey = !!fieldIsKey;
+            field.isRelative = !!fieldIsRelative;
             field.length = fieldLength;
             field.type = fieldType;
             field.name = fieldName;
@@ -183,6 +192,12 @@ class DBLEFile {
             this.fieldOffsets[fieldName] = dbLineLength;
             this.fieldsMap[fieldName] = field;
             if (fieldIsKey) this.indices[fieldName] = new Map(); // set index
+
+            // set relatives
+            if (fieldIsRelative) {
+                this.relatives[fieldName] = field.parse(await readBytes(fieldLength), 0);
+                this.relativeOffsets[fieldName] = bodyOffset;
+            }
 
             dbLineLength += fieldLength;
         }
@@ -197,6 +212,12 @@ class DBLEFile {
 
         // calculate padding
         this.bodyOffset += ((dbHeadLength + dbLineLength - 1) & ~(dbLineLength - 1)) - dbHeadLength;
+    }
+
+    _getDefaultOf(type, relative) {
+        if (typeof type.default === 'function') {
+            return type.default(relative);
+        }
     }
 
     // safely retrieve normalized index mapping target mapping
@@ -235,7 +256,7 @@ class DBLEFile {
         this._lineCache.set(line, buf);
 
         // remove oldest added cache
-        if (this._lineCache.size > (this.options.maxLineCache || 512)) {
+        if (this._lineCache.size > (this.options.maxLineCache || (this.options.maxLineCache = Math.ceil((this.options.maxLineCacheSize || 1048576) / this.lineLength)))) {
             this._lineCache.delete(this._lineCache.keys().next().value);
         }
     }
@@ -272,6 +293,25 @@ class DBLEFile {
         this._setLineCache(line, writeBuf);
     }
 
+    _getRelative(field) {
+        return this.relatives[field];
+    }
+
+    async _setRelative(field, value) {
+        const type = this.fieldsMap[field];
+        const buf = Buffer.alloc(type.length);
+        type.write(value, buf, 0);
+
+        // write line
+        await this.jdb.handle.write(buf, 0, buf.length, this.relativeOffsets[field]);
+
+        this.relatives[field] = value;
+    }
+
+    _getDefaultByField(field, relative) {
+        return this._getDefaultOf(this.fieldsMap[field], relative);
+    }
+
     // append a line
     async _appendLineBuffer(buf, offset = 0) {
         if (!Buffer.isBuffer(buf)) throw new TypeError('buf must be a buffer.');
@@ -304,6 +344,11 @@ class DBLEFile {
             this.indices[i].set(this._getIndexKey(this._getFieldFromLine(writeBuf, i)), targetLine);
         }
 
+        // update relatives
+        for (let i in this.relatives) {
+            await this._setRelative(i, this._getFieldFromLine(writeBuf, i));
+        }
+
         return targetLine;
     }
 
@@ -330,6 +375,7 @@ class DBLEFile {
     _setFieldsToLine(buf, fields) {
         for (let field in fields) {
             if (this.fieldsMap[field]) {
+                if (fields[field] === undefined) continue;
                 this.fieldsMap[field].write(fields[field], buf, this.fieldOffsets[field]);
             }
         }
@@ -372,7 +418,7 @@ class DBLEFile {
 
     async * _readlines(start = 0, end, startLineOnly = true) {
         let line = start;
-        const bufSize = this.options.scanBufferSize || 512;
+        const bufSize = this.options.scanBufferLines || (this.options.scanBufferLines = Math.ceil((this.options.scanBufferSize || 1048576) / this.lineLength));
         let chunkLine = 0;
         let chunk = null;
         let chunkSize = 0;
@@ -474,6 +520,20 @@ class DBLEFile {
         }, skipQueue);
     }
 
+    readLine(line, skipQueue) {
+        return this._doTask(async () => {
+            return this._parseLine(await this._getLineBuffer(line));
+        }, skipQueue);
+    }
+
+    readLineByField(field, query, skipQueue) {
+        return this._doTask(async () => {
+            const line = await this.getLineByField(field, query, true);
+            if (line === undefined) return;
+            return this.readLine(line, true);
+        }, skipQueue);
+    }
+
     findLine(fn, skipQueue) {
         return this._doTask(async () => {
             for await (let { chunk, line } of this._readlines()) {
@@ -520,12 +580,7 @@ class DBLEFile {
                 await this._writeLineBuffer(line, buf);
                 return line;
             } else { // create a new line
-                const buf = Buffer.alloc(this.lineLength);
-                buf[0] = (buf[0] & 0x3F) | (0b00 << 6); // set type 
-                this._setFieldsToLine(buf, fields);
-                buf.writeUInt32LE(0xFFFFFFFF, 2);
-
-                return await this._appendLineBuffer(buf);
+                return await this.appendLine(fields, true);
             }
         }, skipQueue);
     }
@@ -535,6 +590,23 @@ class DBLEFile {
             const line = await this.getLineByField(field, query, true);
             if (fields[field] === undefined) fields[field] = query;
             await this.setLine(line, fields, true);
+        }, skipQueue);
+    }
+
+    appendLine(fields = {}, skipQueue) {
+        return this._doTask(async () => {
+            const buf = Buffer.alloc(this.lineLength);
+            buf[0] = (buf[0] & 0x3F) | (0b00 << 6); // set type
+
+            // set relatives
+            for (let i in this.relatives) {
+                fields[i] = fields[i] ?? this._getDefaultByField(i, this.relatives[i]);
+            }
+
+            this._setFieldsToLine(buf, fields);
+            buf.writeUInt32LE(0xFFFFFFFF, 2);
+
+            return await this._appendLineBuffer(buf);
         }, skipQueue);
     }
 
@@ -612,15 +684,28 @@ class DBLEFile {
             else throw new Error(`JDB (DBLE): Line not found by field "${field}".`);
         }, skipQueue);
     }
+
+    async sync(skipQueue) {
+        return this._doTask(async () => {
+            await this.jdb.sync();
+        }, skipQueue);
+    }
+
+    async datasync(skipQueue) {
+        return this._doTask(async () => {
+            await this.jdb.datasync();
+        }, skipQueue);
+    }
 }
 
 // DBLE field
 class DBLEField {
-    constructor(length = 0, type = 'null', name = 'null', isKey = false) {
+    constructor(length = 0, type = 'null', name = 'null', isKey = false, isRelative = false) {
         this.length = length;
         this.type = type;
         this.name = name;
         this.isKey = isKey;
+        this.isRelative = isRelative;
     }
 
     parse(buf, offset) {
@@ -632,6 +717,10 @@ class DBLEField {
         return buf;
     }
 
+    default(relative) {
+        return;
+    }
+
     toDefinitionBuffer(isLast) {
         const typeBuf = Buffer.from(this.type, 'utf8');
         const nameBuf = Buffer.from(this.name, 'utf8');
@@ -640,7 +729,7 @@ class DBLEField {
         if (typeBuf.length > 255) throw new Error('Field type length must not over 255 bytes.');
         if (nameBuf.length > 255) throw new Error('Field name length must not over 255 bytes.');
 
-        const definitionBuf = Buffer.alloc(6 + typeBuf.length + nameBuf.length);
+        const definitionBuf = Buffer.alloc(6 + typeBuf.length + nameBuf.length + (this.isRelative ? this.length : 0));
 
         definitionBuf.writeUInt16BE(
             (isLast ? 1 : 0) | // isLast
@@ -660,8 +749,8 @@ class DBLEField {
 
 // Int8 (1 byte)
 class DBLEInt8Field extends DBLEField {
-    constructor(name, isKey) {
-        super(1, 'Int8', name, isKey);
+    constructor(name, isKey, isRelative) {
+        super(1, 'Int8', name, isKey, isRelative);
     }
 
     parse(buf, offset) {
@@ -672,12 +761,16 @@ class DBLEInt8Field extends DBLEField {
         buf.writeInt8(data, offset);
         return buf;
     }
+
+    default(relative = -1) {
+        return relative + 1;
+    }
 }
 
 // UInt8 (1 byte)
 class DBLEUInt8Field extends DBLEField {
-    constructor(name, isKey) {
-        super(1, 'UInt8', name, isKey);
+    constructor(name, isKey, isRelative) {
+        super(1, 'UInt8', name, isKey, isRelative);
     }
 
     parse(buf, offset) {
@@ -688,12 +781,16 @@ class DBLEUInt8Field extends DBLEField {
         buf.writeUInt8(data, offset);
         return buf;
     }
+
+    default(relative = -1) {
+        return relative + 1;
+    }
 }
 
 // Int16 (2 bytes)
 class DBLEInt16Field extends DBLEField {
-    constructor(name, isKey) {
-        super(2, 'Int16', name, isKey);
+    constructor(name, isKey, isRelative) {
+        super(2, 'Int16', name, isKey, isRelative);
     }
 
     parse(buf, offset) {
@@ -704,12 +801,16 @@ class DBLEInt16Field extends DBLEField {
         buf.writeInt16LE(data, offset);
         return buf;
     }
+
+    default(relative = -1) {
+        return relative + 1;
+    }
 }
 
 // UInt16 (2 bytes)
 class DBLEUInt16Field extends DBLEField {
-    constructor(name, isKey) {
-        super(2, 'UInt16', name, isKey);
+    constructor(name, isKey, isRelative) {
+        super(2, 'UInt16', name, isKey, isRelative);
     }
 
     parse(buf, offset) {
@@ -720,12 +821,16 @@ class DBLEUInt16Field extends DBLEField {
         buf.writeUInt16LE(data, offset);
         return buf;
     }
+
+    default(relative = -1) {
+        return relative + 1;
+    }
 }
 
 // Int32 (4 bytes)
 class DBLEInt32Field extends DBLEField {
-    constructor(name, isKey) {
-        super(4, 'Int32', name, isKey);
+    constructor(name, isKey, isRelative) {
+        super(4, 'Int32', name, isKey, isRelative);
     }
 
     parse(buf, offset) {
@@ -736,12 +841,16 @@ class DBLEInt32Field extends DBLEField {
         buf.writeInt32LE(data, offset);
         return buf;
     }
+
+    default(relative = -1) {
+        return relative + 1;
+    }
 }
 
 // UInt32 (4 bytes)
 class DBLEUInt32Field extends DBLEField {
-    constructor(name, isKey) {
-        super(4, 'UInt32', name, isKey);
+    constructor(name, isKey, isRelative) {
+        super(4, 'UInt32', name, isKey, isRelative);
     }
 
     parse(buf, offset) {
@@ -752,12 +861,16 @@ class DBLEUInt32Field extends DBLEField {
         buf.writeUInt32LE(data, offset);
         return buf;
     }
+
+    default(relative = -1) {
+        return relative + 1;
+    }
 }
 
 // BigInt64 (8 bytes)
 class DBLEBigInt64Field extends DBLEField {
-    constructor(name, isKey) {
-        super(8, 'BigInt64', name, isKey);
+    constructor(name, isKey, isRelative) {
+        super(8, 'BigInt64', name, isKey, isRelative);
     }
 
     parse(buf, offset) {
@@ -768,12 +881,16 @@ class DBLEBigInt64Field extends DBLEField {
         buf.writeBigInt64LE(BigInt(data), offset);
         return buf;
     }
+
+    default(relative = -1n) {
+        return relative + 1n;
+    }
 }
 
 // BigUInt64 (8 bytes)
 class DBLEBigUInt64Field extends DBLEField {
-    constructor(name, isKey) {
-        super(8, 'BigUInt64', name, isKey);
+    constructor(name, isKey, isRelative) {
+        super(8, 'BigUInt64', name, isKey, isRelative);
     }
 
     parse(buf, offset) {
@@ -784,12 +901,16 @@ class DBLEBigUInt64Field extends DBLEField {
         buf.writeBigUInt64LE(BigInt(data), offset);
         return buf;
     }
+
+    default(relative = -1n) {
+        return relative + 1n;
+    }
 }
 
 // Float (4 bytes)
 class DBLEFloatField extends DBLEField {
-    constructor(name, isKey) {
-        super(4, 'Float', name, isKey);
+    constructor(name, isKey, isRelative) {
+        super(4, 'Float', name, isKey, isRelative);
     }
 
     parse(buf, offset) {
@@ -800,12 +921,16 @@ class DBLEFloatField extends DBLEField {
         buf.writeFloatLE(data, offset);
         return buf;
     }
+
+    default(relative = -1) {
+        return relative + 1;
+    }
 }
 
 // Double (8 bytes)
 class DBLEDoubleField extends DBLEField {
-    constructor(name, isKey) {
-        super(8, 'Double', name, isKey);
+    constructor(name, isKey, isRelative) {
+        super(8, 'Double', name, isKey, isRelative);
     }
 
     parse(buf, offset) {
@@ -816,12 +941,16 @@ class DBLEDoubleField extends DBLEField {
         buf.writeDoubleLE(data, offset);
         return buf;
     }
+
+    default(relative = -1) {
+        return relative + 1;
+    }
 }
 
 // String (2 + n Bytes)
 class DBLEStringField extends DBLEField {
-    constructor(maxLength, name, isKey) {
-        super(2 + maxLength, 'String', name, isKey);
+    constructor(maxLength, name, isKey, isRelative) {
+        super(2 + maxLength, 'String', name, isKey, isRelative);
     }
 
     parse(buf, offset) {
@@ -842,8 +971,8 @@ class DBLEStringField extends DBLEField {
 
 // Buffer (2 + n Bytes)
 class DBLEBufferField extends DBLEField {
-    constructor(maxLength, name, isKey) {
-        super(2 + maxLength, 'Buffer', name, isKey);
+    constructor(maxLength, name, isKey, isRelative) {
+        super(2 + maxLength, 'Buffer', name, isKey, isRelative);
     }
 
     parse(buf, offset) {
@@ -863,26 +992,26 @@ class DBLEBufferField extends DBLEField {
 }
 
 class DBLEAnyField extends DBLEField {
-    constructor(length, name, isKey) {
-        super(length, 'Any', name, isKey);
+    constructor(length, name, isKey, isRelative) {
+        super(length, 'Any', name, isKey, isRelative);
     }
 }
 
 // dble default types
 const defaultDBLETypes = {
-    Int8: DBLEInt8Field,
-    UInt8: DBLEUInt8Field,
-    Int16: DBLEInt16Field,
-    UInt16: DBLEUInt16Field,
-    Int32: DBLEInt32Field,
-    UInt32: DBLEUInt32Field,
-    BigInt64: DBLEBigInt64Field,
-    BigUInt64: DBLEBigUInt64Field,
-    Float: DBLEFloatField,
-    Double: DBLEDoubleField,
-    String: DBLEStringField,
-    Buffer: DBLEBufferField,
-    Any: DBLEAnyField
+    Int8: DBLEInt8Field, i8: DBLEInt8Field,
+    UInt8: DBLEUInt8Field, u8: DBLEUInt8Field, byte: DBLEUInt8Field,
+    Int16: DBLEInt16Field, i16: DBLEInt16Field,
+    UInt16: DBLEUInt16Field, u16: DBLEUInt16Field,
+    Int32: DBLEInt32Field, i32: DBLEInt32Field,
+    UInt32: DBLEUInt32Field, u32: DBLEUInt32Field,
+    BigInt64: DBLEBigInt64Field, i64: DBLEBigInt64Field,
+    BigUInt64: DBLEBigUInt64Field, u64: DBLEBigUInt64Field,
+    Float: DBLEFloatField, f32: DBLEFloatField,
+    Double: DBLEDoubleField, f64: DBLEDoubleField,
+    String: DBLEStringField, str: DBLEStringField,
+    Buffer: DBLEBufferField, buf: DBLEBufferField,
+    Any: DBLEAnyField, any: DBLEBufferField
 };
 
 // export

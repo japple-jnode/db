@@ -65,6 +65,14 @@ class JDBFile {
     close() {
         return this.handle.close();
     }
+
+    sync() {
+        return this.handle.sync();
+    }
+
+    datasync() {
+        return this.handle.datasync();
+    }
 }
 
 // export
