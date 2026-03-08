@@ -5,7 +5,7 @@ Simple database package for Node.js.
 
 JDB Lite Extended (DBLE) is a simple, fast and extensiable database format.
 
-by JustApple     (format design, programming) &
+by JustApple     (format design, programming, testing) &
    Google Gemini (code review, small bug fix, completion of default types)
 */
 
@@ -196,7 +196,7 @@ class DBLEFile {
             // set relatives
             if (fieldIsRelative) {
                 this.relatives[fieldName] = field.parse(await readBytes(fieldLength), 0);
-                this.relativeOffsets[fieldName] = bodyOffset;
+                this.relativeOffsets[fieldName] = this.bodyOffset - fieldLength;
             }
 
             dbLineLength += fieldLength;
@@ -339,14 +339,17 @@ class DBLEFile {
             await this.jdb.handle.write(lastEmptyLineBuf, 0, 4, this.lastEmptyLineOffset);
         }
 
-        // update indecies
-        for (let i in this.indices) {
-            this.indices[i].set(this._getIndexKey(this._getFieldFromLine(writeBuf, i)), targetLine);
-        }
+        // update for start line
+        if ((writeBuf[0] & 0xC0) === (0b00 << 6)) {
+            // update indecies
+            for (let i in this.indices) {
+                this.indices[i].set(this._getIndexKey(this._getFieldFromLine(writeBuf, i)), targetLine);
+            }
 
-        // update relatives
-        for (let i in this.relatives) {
-            await this._setRelative(i, this._getFieldFromLine(writeBuf, i));
+            // update relatives
+            for (let i in this.relatives) {
+                await this._setRelative(i, this._getFieldFromLine(writeBuf, i));
+            }
         }
 
         return targetLine;
@@ -395,7 +398,8 @@ class DBLEFile {
             const type = lineBuf[0] & 0xC0;
             if (type === (0b00 << 6) || type === (0b11 << 6)) { // remove from index mapping
                 for (let i in this.indices) {
-                    this.indices[i].delete(this._getIndexKey(this._getFieldFromLine(lineBuf, i)));
+                    const key = this._getIndexKey(this._getFieldFromLine(lineBuf, i));
+                    if (this.indices[i].get(key) === nextLine) this.indices[i].delete(key);
                 }
             }
 
@@ -559,24 +563,31 @@ class DBLEFile {
                 buf[0] = (buf[0] & 0x3F) | (0b00 << 6); // set type appropriately
 
                 // check index mappings accurately
+                const oldValues = {};
                 for (let i in this.indices) {
-                    const currentValue = this._getFieldFromLine(buf, i);
-                    const newVal = fields[i];
+                    if (fields[i] !== undefined) oldValues[i] = this._getFieldFromLine(buf, i);
+                }
 
-                    if (newVal !== undefined) {
-                        let isDifferent = currentValue !== newVal;
-                        if (Buffer.isBuffer(currentValue) && Buffer.isBuffer(newVal)) {
-                            isDifferent = !currentValue.equals(newVal);
+                this._setFieldsToLine(buf, fields);
+
+                for (let i in this.indices) {
+                    if (fields[i] !== undefined) {
+                        const oldVal = oldValues[i];
+                        const newVal = this._getFieldFromLine(buf, i);
+
+                        let isDifferent = oldVal !== newVal;
+                        if (Buffer.isBuffer(oldVal) && Buffer.isBuffer(newVal)) {
+                            isDifferent = !oldVal.equals(newVal);
                         }
 
                         if (isDifferent) {
-                            this.indices[i].delete(this._getIndexKey(currentValue));
+                            const oldKey = this._getIndexKey(oldVal);
+                            if (this.indices[i].get(oldKey) === line) this.indices[i].delete(oldKey);
                             this.indices[i].set(this._getIndexKey(newVal), line);
                         }
                     }
                 }
 
-                this._setFieldsToLine(buf, fields);
                 await this._writeLineBuffer(line, buf);
                 return line;
             } else { // create a new line
@@ -733,7 +744,8 @@ class DBLEField {
 
         definitionBuf.writeUInt16BE(
             (isLast ? 1 : 0) | // isLast
-            (this.isKey ? 1 << 1 : 0) // isKey
+            (this.isKey ? 1 << 1 : 0) | // isKey
+            (this.isRelative ? 1 << 2 : 0) // isRelative
         ); // flag
         definitionBuf.writeUInt16LE(this.length, 2); // field length
         definitionBuf.writeUInt8(typeBuf.length, 4); // field type length
