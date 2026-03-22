@@ -1009,6 +1009,26 @@ class DBLEAnyField extends DBLEField {
     }
 }
 
+// Date (8 Bytes in BigUInt64 ms)
+class DBLEDateField extends DBLEField {
+    constructor(name, isKey, isRelative) {
+        super(8, 'Date', name, isKey, isRelative);
+    }
+
+    parse(buf, offset) {
+        return new Date(Number(buf.readBigInt64LE(offset)));
+    }
+
+    write(data, buf = Buffer.alloc(this.length), offset = 0) {
+        buf.writeBigInt64LE(BigInt(data.getTime()), offset);
+        return buf;
+    }
+
+    default() {
+        return new Date();
+    }
+}
+
 // dble default types
 const defaultDBLETypes = {
     Int8: DBLEInt8Field, i8: DBLEInt8Field,
@@ -1023,7 +1043,8 @@ const defaultDBLETypes = {
     Double: DBLEDoubleField, f64: DBLEDoubleField,
     String: DBLEStringField, str: DBLEStringField,
     Buffer: DBLEBufferField, buf: DBLEBufferField,
-    Any: DBLEAnyField, any: DBLEBufferField
+    Any: DBLEAnyField, any: DBLEBufferField,
+    Date: DBLEDateField, date: DBLEDateField
 };
 
 // export
@@ -1035,5 +1056,6 @@ module.exports = {
     DBLEFloatField, DBLEDoubleField,
     DBLEStringField, DBLEBufferField,
     DBLEAnyField,
+    DBLEDateField,
     defaultDBLETypes
 };

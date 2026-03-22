@@ -265,6 +265,7 @@ Access these via `require('@jnode/db/dble')` or `dble.defaultDBLETypes`:
 - `DBLEStringField(maxLength, name, isKey, isRelative)`
 - `DBLEBufferField(maxLength, name, isKey, isRelative)`
 - `DBLEAnyField(length, name, isKey, isRelative)`
+- `DBLEDateField(name, isKey, isRelative)`
 
 *Note: The `maxLength` argument is required for String and Buffer types to enforce DBLE's fixed-length binary schema standard.*
 
