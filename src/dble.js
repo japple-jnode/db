@@ -19,6 +19,7 @@ class DBLEFile {
         this.options = options;
         this._lineCache = new Map();
         this.types = Object.assign({}, defaultDBLETypes, options.types);
+        this._task = Promise.resolve();
     }
 
     static async load(path, options = {}) {
@@ -244,10 +245,9 @@ class DBLEFile {
     // simple task queue
     _doTask(func, skipQueue) {
         if (skipQueue) return func();
-        return this._task = (async () => {
-            try { await this._task; } catch { }
-            return await func();
-        })();
+        const task = this._task.then(() => func());
+        this._task = task.catch(() => null);
+        return task;
     }
 
     _setLineCache(line, buf) {
